@@ -1,0 +1,386 @@
+# ==================== 参数设置区域 ====================
+# 文件路径设置
+input_file <- "D:/2/1.xlsx"
+output_dir <- "D:/2/selected"
+
+# 方法开关设置 (TRUE = 开启, FALSE = 关闭)
+use_mutual_info <- TRUE   # 是否使用Mutual Information筛选
+use_lasso <- TRUE         # 是否使用LASSO筛选
+
+# Mutual Information 参数
+mi_threshold_method <- "quantile"  # 阈值方法: "quantile" 或 "mean"
+mi_threshold_quantile <- 0.5       # 当method="quantile"时, 保留得分前50%的特征 (0-1之间)
+mi_nbins <- 10                     # 离散化的箱数
+
+# LASSO 参数
+lasso_alpha <- 1              # 1=LASSO, 0=Ridge, 0-1=Elastic Net
+lasso_nfolds <- 10            # 交叉验证折数
+lasso_lambda_type <- "1se"    # "min" 或 "1se" (1se更稀疏)
+lasso_seed <- 123             # 随机种子
+
+# 可视化参数
+tiff_width <- 3600            # TIFF图像宽度 (提高分辨率)
+tiff_height <- 3000           # TIFF图像高度 (提高分辨率)
+tiff_dpi <- 600               # 分辨率 (2区期刊通常要求600 dpi)
+
+# ==================== 参数设置结束 ====================
+
+# 检查至少开启一种方法
+if (!use_mutual_info && !use_lasso) {
+  stop("Error: At least one selection method must be enabled (use_mutual_info or use_lasso)")
+}
+
+# 安装并加载必要的包
+if (!require("readxl")) install.packages("readxl")
+if (!require("writexl")) install.packages("writexl")
+if (use_lasso && !require("glmnet")) install.packages("glmnet")
+if (use_mutual_info && !require("infotheo")) install.packages("infotheo")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("gridExtra")) install.packages("gridExtra")
+
+library(readxl)
+library(writexl)
+library(ggplot2)
+library(gridExtra)
+if (use_lasso) library(glmnet)
+if (use_mutual_info) library(infotheo)
+
+# 创建输出文件夹
+if (use_mutual_info) {
+  dir.create(file.path(output_dir, "mutual_info"), recursive = TRUE, showWarnings = FALSE)
+}
+if (use_lasso) {
+  dir.create(file.path(output_dir, "lasso"), recursive = TRUE, showWarnings = FALSE)
+}
+
+# 1. 读取数据
+cat("Reading data...\n")
+data <- read_excel(input_file)
+y <- data[[1]]  # 第一列为因变量
+X <- data[, -1]  # 其他列为自变量
+var_names <- names(X)
+
+cat(paste("Dependent variable:", names(data)[1], "\n"))
+cat(paste("Number of independent variables:", ncol(X), "\n"))
+
+# ==================== 2. Mutual Information 筛选 ====================
+if (use_mutual_info) {
+  cat("\nPerforming Mutual Information selection...\n")
+  
+  # 计算互信息
+  mi_scores <- sapply(X, function(x) {
+    # 离散化连续变量
+    x_disc <- discretize(x, disc="equalwidth", nbins=mi_nbins)
+    y_disc <- discretize(y, disc="equalwidth", nbins=mi_nbins)
+    # 计算互信息
+    mutinformation(x_disc, y_disc)
+  })
+  
+  # 按互信息得分排序
+  mi_results <- data.frame(
+    Variable = var_names,
+    MI_Score = mi_scores,
+    Rank = rank(-mi_scores)
+  )
+  mi_results <- mi_results[order(-mi_results$MI_Score), ]
+  
+  # 根据选择的方法计算阈值
+  if (mi_threshold_method == "mean") {
+    mi_threshold <- mean(mi_scores)
+    cat(paste("MI threshold method: Arithmetic Mean =", round(mi_threshold, 4), "\n"))
+  } else if (mi_threshold_method == "quantile") {
+    mi_threshold <- quantile(mi_scores, 1 - mi_threshold_quantile)
+    cat(paste("MI threshold method: Quantile (top", mi_threshold_quantile*100, "%) =", 
+              round(mi_threshold, 4), "\n"))
+  } else {
+    stop("Error: mi_threshold_method must be 'mean' or 'quantile'")
+  }
+  
+  # 选择特征
+  selected_mi <- mi_results$Variable[mi_results$MI_Score >= mi_threshold]
+  
+  cat(paste("MI selected features:", length(selected_mi), "/", length(var_names), "\n"))
+  
+  # 保存MI筛选结果
+  mi_params <- data.frame(
+    Parameter = c("Threshold Method", "Threshold Value", 
+                  if(mi_threshold_method == "quantile") "Quantile" else NULL, 
+                  "Number of Bins"),
+    Value = c(mi_threshold_method, round(mi_threshold, 4), 
+              if(mi_threshold_method == "quantile") mi_threshold_quantile else NULL, 
+              mi_nbins)
+  )
+  
+  write_xlsx(
+    list(
+      Parameters = mi_params,
+      MI_Scores = mi_results,
+      Selected_Variables = data.frame(Variable = selected_mi)
+    ),
+    path = file.path(output_dir, "mutual_info", "mi_results.xlsx")
+  )
+  
+  # 保存MI筛选后的数据
+  selected_data_mi <- cbind(data[1], X[, selected_mi])
+  write_xlsx(selected_data_mi, 
+             path = file.path(output_dir, "mutual_info", "selected_data.xlsx"))
+} else {
+  cat("\nMutual Information selection disabled\n")
+  selected_mi <- character(0)
+}
+
+# ==================== 3. LASSO 筛选 ====================
+if (use_lasso) {
+  cat("\nPerforming LASSO selection...\n")
+  
+  # 准备数据矩阵
+  X_matrix <- as.matrix(X)
+  y_vector <- as.numeric(y)
+  
+  # 使用交叉验证选择最优lambda
+  set.seed(lasso_seed)
+  cv_lasso <- cv.glmnet(X_matrix, y_vector, alpha = lasso_alpha, nfolds = lasso_nfolds)
+  
+  # 选择lambda
+  best_lambda <- if (lasso_lambda_type == "min") {
+    cv_lasso$lambda.min
+  } else {
+    cv_lasso$lambda.1se
+  }
+  
+  # 拟合LASSO模型
+  lasso_model <- glmnet(X_matrix, y_vector, alpha = lasso_alpha, lambda = best_lambda)
+  
+  # 提取非零系数
+  lasso_coef <- coef(lasso_model)
+  selected_lasso_idx <- which(lasso_coef[-1] != 0)  # 排除截距
+  selected_lasso <- var_names[selected_lasso_idx]
+  
+  cat(paste("LASSO selected features:", length(selected_lasso), "/", length(var_names), "\n"))
+  
+  # 保存LASSO筛选结果
+  lasso_results <- data.frame(
+    Variable = var_names,
+    Coefficient = as.numeric(lasso_coef[-1]),
+    Selected = var_names %in% selected_lasso
+  )
+  lasso_results <- lasso_results[order(-abs(lasso_results$Coefficient)), ]
+  
+  # 保存lambda路径数据
+  lambda_path <- data.frame(
+    Lambda = cv_lasso$lambda,
+    MSE = cv_lasso$cvm,
+    MSE_SD = cv_lasso$cvsd
+  )
+  
+  write_xlsx(
+    list(
+      LASSO_Coefficients = lasso_results,
+      Selected_Variables = data.frame(Variable = selected_lasso),
+      Lambda_Path = lambda_path
+    ),
+    path = file.path(output_dir, "lasso", "lasso_results.xlsx")
+  )
+  
+  # 保存LASSO筛选后的数据
+  if (length(selected_lasso) > 0) {
+    selected_data_lasso <- cbind(data[1], X[, selected_lasso])
+    write_xlsx(selected_data_lasso, 
+               path = file.path(output_dir, "lasso", "selected_data.xlsx"))
+  }
+} else {
+  cat("\nLASSO selection disabled\n")
+  selected_lasso <- character(0)
+}
+
+# ==================== 4. 可视化 ====================
+cat("\nGenerating visualizations...\n")
+
+# MI可视化
+if (use_mutual_info) {
+  # 添加阈值标签
+  threshold_label <- if (mi_threshold_method == "mean") {
+    paste0("Threshold: Mean = ", round(mi_threshold, 4))
+  } else {
+    paste0("Threshold: Top ", mi_threshold_quantile*100, "% = ", round(mi_threshold, 4))
+  }
+  
+  p1 <- ggplot(mi_results, aes(x = reorder(Variable, MI_Score), y = MI_Score)) +
+    geom_bar(stat = "identity", aes(fill = MI_Score >= mi_threshold), color = "black", size = 0.3) +
+    scale_fill_manual(values = c("gray85", "gray30"), 
+                      labels = c("Not Selected", "Selected"),
+                      name = "") +
+    coord_flip() +
+    geom_hline(yintercept = mi_threshold, linetype = "dashed", color = "black", size = 0.5) +
+    annotate("text", x = 1, y = mi_threshold, 
+             label = threshold_label, color = "black", hjust =  -0.1, vjust = -0.5, size = 4) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)), limits = c(0, NA)) +
+    labs(title = "Mutual Information Feature Importance",
+         x = "Features",
+         y = "MI Score") +
+    theme_classic(base_size = 12) +
+    theme(axis.text.y = element_text(size = 9, color = "black"),
+          axis.text.x = element_text(size = 10, color = "black"),
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+          axis.title.y = element_text(size = 12, face = "bold"),
+          axis.line = element_line(color = "black", size = 0.5),
+          axis.ticks = element_line(color = "black", size = 0.5),
+          legend.position = "top",
+          legend.text = element_text(size = 10),
+          legend.key.size = unit(0.8, "cm"),
+          panel.grid = element_blank(),
+          plot.margin = unit(c(1, 1, 1, 1), "cm"))
+  
+  # 保存MI可视化
+  tiff(file.path(output_dir, "mutual_info", "mi_visualization.tiff"),
+       width = tiff_width, height = tiff_height, res = tiff_dpi, compression = "lzw")
+  print(p1)
+  dev.off()
+}
+
+# LASSO可视化
+if (use_lasso) {
+  # LASSO交叉验证曲线
+  p2_data <- data.frame(
+    Lambda = log(cv_lasso$lambda),
+    MSE = cv_lasso$cvm,
+    Upper = cv_lasso$cvm + cv_lasso$cvsd,
+    Lower = cv_lasso$cvm - cv_lasso$cvsd
+  )
+  
+  # 计算标注位置
+  lambda_pos <- log(best_lambda)
+  mse_range <- max(p2_data$MSE) - min(p2_data$MSE)
+  label_y <- max(p2_data$MSE) - mse_range * 0.15
+  
+  p2 <- ggplot(p2_data, aes(x = Lambda, y = MSE)) +
+    geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "gray70", alpha = 0.5) +
+    geom_line(color = "black", size = 0.8) +
+    geom_vline(xintercept = lambda_pos, linetype = "dashed", color = "black", size = 0.5) +
+    annotate("text", x = lambda_pos, y = label_y,
+             label = paste0("Lambda = ", format(best_lambda, scientific = FALSE, digits = 1.5)),
+             color = "black", hjust = -0.1, size = 4) +
+    labs(title = "LASSO Cross-Validation Curve",
+         x = "log(Lambda)",
+         y = "Mean Squared Error") +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+          axis.title.y = element_text(size = 12, face = "bold"),
+          axis.text = element_text(size = 10, color = "black"),
+          axis.line = element_line(color = "black", size = 0.5),
+          axis.ticks = element_line(color = "black", size = 0.5),
+          panel.grid = element_blank(),
+          plot.margin = unit(c(1, 1, 1, 1), "cm"))
+  
+  # LASSO系数条形图
+  lasso_selected_results <- lasso_results[lasso_results$Selected, ]
+  if (nrow(lasso_selected_results) > 0) {
+    p3 <- ggplot(lasso_selected_results, 
+                 aes(x = reorder(Variable, abs(Coefficient)), y = Coefficient)) +
+      geom_bar(stat = "identity", fill = "gray30", color = "black", size = 0.3) +
+      geom_hline(yintercept = 0, color = "black", size = 0.5) +
+      coord_flip() +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.05)), limits = c(0, NA)) +
+      labs(title = "LASSO Selected Features",
+           x = "Features",
+           y = "Coefficient Value") +
+      theme_classic(base_size = 12) +
+      theme(axis.text.y = element_text(size = 9, color = "black"),
+            axis.text.x = element_text(size = 10, color = "black"),
+            plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+            axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+            axis.title.y = element_text(size = 12, face = "bold"),
+            axis.line = element_line(color = "black", size = 0.5),
+            axis.ticks = element_line(color = "black", size = 0.5),
+            panel.grid = element_blank(),
+            plot.margin = unit(c(1, 1, 1, 1), "cm"))
+  } else {
+    p3 <- ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, 
+               label = "No features selected by LASSO", size = 6, color = "black") +
+      theme_void() +
+      theme(plot.margin = unit(c(1, 1, 1, 1), "cm"))
+  }
+  
+  # 保存LASSO可视化
+  tiff(file.path(output_dir, "lasso", "lasso_cv_curve.tiff"),
+       width = tiff_width, height = tiff_height, res = tiff_dpi, compression = "lzw")
+  print(p2)
+  dev.off()
+  
+  tiff(file.path(output_dir, "lasso", "lasso_coefficients.tiff"),
+       width = tiff_width, height = tiff_height, res = tiff_dpi, compression = "lzw")
+  print(p3)
+  dev.off()
+}
+
+# 对比可视化 (仅当两种方法都开启时)
+if (use_mutual_info && use_lasso) {
+  comparison <- data.frame(
+    Variable = var_names,
+    MI_Selected = var_names %in% selected_mi,
+    LASSO_Selected = var_names %in% selected_lasso
+  )
+  comparison$Both <- comparison$MI_Selected & comparison$LASSO_Selected
+  
+  summary_data <- data.frame(
+    Method = c("MI Only", "LASSO Only", "Both Methods"),
+    Count = c(
+      sum(comparison$MI_Selected & !comparison$LASSO_Selected),
+      sum(!comparison$MI_Selected & comparison$LASSO_Selected),
+      sum(comparison$Both)
+    )
+  )
+  
+  # 设置灰度填充
+  gray_colors <- c("gray70", "gray50", "gray20")
+  
+  p4 <- ggplot(summary_data, aes(x = Method, y = Count, fill = Method)) +
+    geom_bar(stat = "identity", color = "black", size = 0.5) +
+    geom_text(aes(label = Count), vjust = -0.5, size = 5, fontface = "bold") +
+    scale_fill_manual(values = gray_colors) +
+    labs(title = "Feature Selection Method Comparison",
+         x = "Selection Method",
+         y = "Number of Features") +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+          axis.title.y = element_text(size = 12, face = "bold"),
+          axis.text.x = element_text(size = 10, color = "black"),
+          axis.text.y = element_text(size = 10, color = "black"),
+          axis.line = element_line(color = "black", size = 0.5),
+          axis.ticks = element_line(color = "black", size = 0.5),
+          legend.position = "none",
+          panel.grid = element_blank(),
+          plot.margin = unit(c(1, 1, 1, 1), "cm"))
+  
+  # 保存对比图
+  tiff(file.path(output_dir, "comparison.tiff"),
+       width = tiff_width, height = tiff_height, res = tiff_dpi, compression = "lzw")
+  print(p4)
+  dev.off()
+  
+  # 保存对比数据
+  write_xlsx(
+    list(
+      Feature_Comparison = comparison,
+      Summary = summary_data
+    ),
+    path = file.path(output_dir, "comparison.xlsx")
+  )
+}
+
+cat("\n==================== Completed ====================\n")
+if (use_mutual_info) {
+  cat(paste("MI selected features:", length(selected_mi), "/", length(var_names), "\n"))
+}
+if (use_lasso) {
+  cat(paste("LASSO selected features:", length(selected_lasso), "/", length(var_names), "\n"))
+}
+if (use_mutual_info && use_lasso) {
+  both_selected <- sum(var_names %in% selected_mi & var_names %in% selected_lasso)
+  cat(paste("Features selected by both methods:", both_selected, "\n"))
+}
+cat(paste("\nResults saved to:", output_dir, "\n"))
